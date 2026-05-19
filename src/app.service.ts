@@ -7,7 +7,7 @@ import {
 	type OnModuleInit,
 } from "@nestjs/common";
 import * as dayjs from "dayjs";
-import { type Api, TelegramClient } from "telegram";
+import { Api, TelegramClient } from "telegram";
 import type { Entity } from "telegram/define";
 import { StringSession } from "telegram/sessions";
 
@@ -18,6 +18,12 @@ type NormalizedPost = {
 	date: number;
 	views: number | undefined;
 	forwards: number | undefined;
+};
+
+type GroupedMessage = {
+	id: number;
+	text: string;
+	media: unknown[];
 };
 
 function sleep(delay: number) {
@@ -53,6 +59,165 @@ export class AppService implements OnModuleInit {
 		await this.client.start();
 	}
 
+	async getChannelsV2() {
+		const result = await this.client.invoke(
+			new Api.channels.GetChannels({
+				id: ["ru2ch"],
+			}),
+		);
+
+		return result;
+	}
+
+	async getMessagesV2(options: { channel: string }) {
+		const { channel } = options;
+
+		const LIMIT = 10;
+
+		const tgMessages = await this.client.getMessages(channel, {
+			limit: LIMIT,
+		});
+
+		// getMessages возвращает сообщения от новых к старым:
+		// индекс 0 — самое новое, последний индекс — самое старое.
+		const newest = tgMessages[0];
+		const oldest = tgMessages[tgMessages.length - 1];
+
+		// Собираем все сырые сообщения, начиная с основной выборки.
+		const rawMessages = [...tgMessages];
+
+		// --- Дочитываем нижнюю границу (старые сообщения) ---
+		// Если самое старое сообщение в выборке принадлежит альбому,
+		// часть этого альбома могла остаться за пределами пагинации (старее).
+		if (oldest?.groupedId) {
+			const targetGroupedId = oldest.groupedId;
+			let offsetId = oldest.id;
+			let keepFetching = true;
+
+			while (keepFetching) {
+				const extra = await this.client.getMessages(channel, {
+					limit: 20,
+					offsetId, // получаем сообщения СТАРЕЕ этого id
+				});
+
+				if (extra.length === 0) break;
+
+				keepFetching = false;
+
+				for (const m of extra) {
+					if (m.groupedId && m.groupedId.equals(targetGroupedId)) {
+						rawMessages.push(m);
+						offsetId = m.id;
+						// Продолжаем — вдруг альбом ещё длиннее, чем один батч.
+						keepFetching = true;
+					} else {
+						// Дошли до сообщения из другой группы — альбом закончился.
+						keepFetching = false;
+						break;
+					}
+				}
+			}
+		}
+
+		// --- Дочитываем верхнюю границу (новые сообщения) ---
+		// Если самое новое сообщение принадлежит альбому, часть альбома
+		// могла быть опубликована позже и не попасть в выборку.
+		if (newest?.groupedId) {
+			const targetGroupedId = newest.groupedId;
+			let minId = newest.id;
+			let keepFetching = true;
+
+			while (keepFetching) {
+				const extra = await this.client.getMessages(channel, {
+					limit: 20,
+					minId, // получаем сообщения НОВЕЕ этого id
+				});
+
+				if (extra.length === 0) break;
+
+				keepFetching = false;
+
+				// extra тоже идёт от новых к старым; нас интересуют только
+				// сообщения того же альбома.
+				for (const m of [...extra].reverse()) {
+					if (m.groupedId && m.groupedId.equals(targetGroupedId)) {
+						rawMessages.push(m);
+						minId = Math.max(minId, m.id);
+						keepFetching = true;
+					}
+				}
+			}
+		}
+
+		// --- Нормализация ---
+		const ungroupedMessages = rawMessages.map((rawMessage) => {
+			const text = rawMessage.text;
+			const id = rawMessage.id;
+			const groupedId = rawMessage.groupedId
+				? rawMessage.groupedId.toJSNumber()
+				: null;
+
+			return {
+				text,
+				id,
+				groupedId,
+				media: rawMessage.media,
+			};
+		});
+
+		// Убираем возможные дубликаты (дочитанные сообщения могли пересечься
+		// с основной выборкой) и сортируем от старых к новым для стабильного
+		// порядка репоста.
+		const seenIds = new Set<number>();
+		const dedupedMessages = ungroupedMessages
+			.filter((m) => {
+				if (seenIds.has(m.id)) return false;
+				seenIds.add(m.id);
+				return true;
+			})
+			.sort((a, b) => a.id - b.id);
+
+		// --- Группировка ---
+		const groupedMessagesMap = new Map<number, GroupedMessage>();
+		const result: GroupedMessage[] = [];
+
+		for (const msg of dedupedMessages) {
+			if (msg.groupedId !== null) {
+				const existing = groupedMessagesMap.get(msg.groupedId);
+
+				if (existing) {
+					// Группа уже есть — добавляем media и подхватываем text, если его ещё нет
+					if (msg.media != null) {
+						existing.media.push(msg.media);
+					}
+					if (!existing.text && msg.text) {
+						existing.text = msg.text;
+					}
+				} else {
+					// Первый элемент группы
+					const grouped: GroupedMessage = {
+						id: msg.id,
+						text: msg.text,
+						media: msg.media != null ? [msg.media] : [],
+					};
+					groupedMessagesMap.set(msg.groupedId, grouped);
+					result.push(grouped);
+				}
+			} else {
+				result.push({
+					id: msg.id,
+					text: msg.text,
+					media: msg.media != null ? [msg.media] : [],
+				});
+			}
+		}
+
+		return result;
+	}
+
+	async getMessageV2(options: { channel: string; messageId: number }) {}
+
+	//================================================================================================================
 	async getChannels() {
 		try {
 			const dialogs = await this.client.getDialogs();
