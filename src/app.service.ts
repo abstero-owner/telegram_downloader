@@ -69,13 +69,14 @@ export class AppService implements OnModuleInit {
 		return result;
 	}
 
-	async getMessagesV2(options: { channel: string }) {
-		const { channel } = options;
+	async getMessagesV2(options: { channel: string; messageIds?: number[] }) {
+		const { channel, messageIds } = options;
 
 		const LIMIT = 10;
 
 		const tgMessages = await this.client.getMessages(channel, {
 			limit: LIMIT,
+			ids: messageIds,
 		});
 
 		// getMessages возвращает сообщения от новых к старым:
