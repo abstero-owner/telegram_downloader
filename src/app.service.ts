@@ -1,24 +1,9 @@
 import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
-import {
-	BadRequestException,
-	Injectable,
-	InternalServerErrorException,
-	NotFoundException,
-	type OnModuleInit,
-} from "@nestjs/common";
-import * as dayjs from "dayjs";
+import { Injectable, type OnModuleInit } from "@nestjs/common";
+import { randomUUID } from "node:crypto";
 import { Api, TelegramClient } from "telegram";
-import type { Entity } from "telegram/define";
 import { StringSession } from "telegram/sessions";
-
-type NormalizedPost = {
-	id: number;
-	isAlbum: boolean;
-	messages: Api.Message[]; // всегда массив: для одиночного — один элемент
-	date: number;
-	views: number | undefined;
-	forwards: number | undefined;
-};
+import { getExtension } from "telegram/Utils";
 
 type GroupedMessage = {
 	id: number;
@@ -69,14 +54,18 @@ export class AppService implements OnModuleInit {
 		return result;
 	}
 
-	async getMessagesV2(options: { channel: string; messageIds?: number[] }) {
-		const { channel, messageIds } = options;
+	async getMessagesV2(options: {
+		channel: string;
+		minId: number;
+		download_media?: boolean;
+	}) {
+		const { channel, minId } = options;
 
 		const LIMIT = 10;
 
 		const tgMessages = await this.client.getMessages(channel, {
 			limit: LIMIT,
-			ids: messageIds,
+			minId: minId,
 		});
 
 		// getMessages возвращает сообщения от новых к старым:
@@ -189,7 +178,21 @@ export class AppService implements OnModuleInit {
 				if (existing) {
 					// Группа уже есть — добавляем media и подхватываем text, если его ещё нет
 					if (msg.media != null) {
-						existing.media.push(msg.media);
+						const buffer = await this.client.downloadMedia(msg.media);
+
+						const ext = getExtension(msg.media);
+
+						const key = randomUUID();
+
+						await s3.send(
+							new PutObjectCommand({
+								Bucket: S3_BUCKET,
+								Key: key,
+								Body: buffer,
+								ContentType: this.guessContentType(key, msg),
+							}),
+						);
+						existing.media.push(key);
 					}
 					if (!existing.text && msg.text) {
 						existing.text = msg.text;
@@ -219,125 +222,6 @@ export class AppService implements OnModuleInit {
 	async getMessageV2(options: { channel: string; messageId: number }) {}
 
 	//================================================================================================================
-	async getChannels() {
-		try {
-			const dialogs = await this.client.getDialogs();
-
-			const channels = dialogs.reduce(
-				(acc, dialog) => {
-					if (dialog.entity && dialog.entity.className === "Channel") {
-						acc.push({
-							id: dialog.entity.id.toJSNumber(),
-							title: dialog.entity.title,
-							username: dialog.entity.username || null,
-						});
-					}
-					return acc;
-				},
-				[] as { id: number; title: string; username: string | null }[],
-			);
-
-			return channels;
-		} catch (error) {
-			throw new InternalServerErrorException(error.message);
-		}
-	}
-
-	async getMessages(
-		channelID: string,
-		options: Partial<{ limit: number }> = {},
-	) {
-		const { limit = 10 } = options;
-
-		if (!channelID) {
-			throw new BadRequestException("channelId query parameter is required");
-		}
-
-		try {
-			const dialogs = await this.client.getDialogs();
-
-			const targetChannel = dialogs.find(
-				(d) =>
-					d.entity &&
-					d.entity.className === "Channel" &&
-					(d.entity.id.toString() === channelID ||
-						d.entity.username?.toString() === channelID),
-			);
-
-			if (!targetChannel) {
-				throw new NotFoundException(
-					"Channel you are looking for was not found",
-				);
-			}
-
-			const entity = targetChannel.entity as Entity;
-
-			const rawMessages = await this.client.getMessages(entity, { limit });
-
-			const groups = new Map<string, NormalizedPost>();
-			const ordered: NormalizedPost[] = [];
-
-			for (const message of rawMessages) {
-				if (message.groupedId) {
-					const gid = String(message.groupedId);
-					let post = groups.get(gid);
-					if (!post) {
-						post = {
-							id: message.id,
-							isAlbum: true,
-							messages: [],
-							date: message.date,
-							views: message.views,
-							forwards: message.forwards,
-						};
-						groups.set(gid, post);
-						ordered.push(post);
-					}
-					post.messages.push(message);
-				} else {
-					ordered.push({
-						id: message.id,
-						isAlbum: false,
-						messages: [message],
-						date: message.date,
-						views: message.views,
-						forwards: message.forwards,
-					});
-				}
-			}
-
-			const messages = await Promise.all(
-				ordered.map(async (post) => {
-					let text = "";
-					const mediaFiles: string[] = [];
-
-					for (const mm of post.messages) {
-						if (mm.message) text += `${mm.message}\n`;
-
-						const url = await this.uploadMediaToS3(mm);
-
-						await sleep(1000);
-
-						if (url) mediaFiles.push(url);
-					}
-
-					return {
-						id: post.id,
-						isAlbum: post.isAlbum,
-						text: text.trim(),
-						date: dayjs(post.date * 1000).toISOString(),
-						views: post.views,
-						forwards: post.forwards,
-						mediaFiles,
-					};
-				}),
-			);
-
-			return messages;
-		} catch (error) {
-			throw new InternalServerErrorException(error.message);
-		}
-	}
 
 	private async uploadMediaToS3(message: any): Promise<string | null> {
 		if (!message?.media || message.webPreview) return null;
@@ -398,4 +282,25 @@ export class AppService implements OnModuleInit {
 
 		return (ext && map[ext]) || "application/octet-stream";
 	}
+}
+
+function getMimeType(message: Api.Message): string | undefined {
+	const media = message.media;
+
+	if (!media) return undefined;
+
+	// Фото — у Telegram фото всегда JPEG
+	if (media instanceof Api.MessageMediaPhoto) {
+		return "image/jpeg";
+	}
+
+	// Документ — видео, аудио, файлы, GIF, стикеры, голосовые и т.д.
+	if (media instanceof Api.MessageMediaDocument) {
+		const document = media.document;
+		if (document instanceof Api.Document) {
+			return document.mimeType; // например "video/mp4", "audio/ogg", "application/pdf"
+		}
+	}
+
+	return undefined;
 }

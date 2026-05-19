@@ -12,23 +12,6 @@ export class AppController {
 			status: "ok",
 		};
 	}
-	@Get("channels")
-	async getChannels() {
-		const channels = await this.appService.getChannels();
-
-		return {
-			channels,
-		};
-	}
-
-	@Get("messages")
-	async getMessages(@Query("channelId") channelId: string) {
-		const messages = await this.appService.getMessages(channelId);
-
-		return {
-			messages,
-		};
-	}
 
 	@Get("v2/channels")
 	async getChannelsV2() {
@@ -52,13 +35,17 @@ export class AppControllerV1 {
 	}
 
 	@Get("messages")
-	async getMessages(@Query("channel") channel: string) {
+	async getMessages(
+		@Query("channel") channel: string,
+		@Query("min_id") minId: number,
+	) {
 		if (!channel) {
 			throw new BadRequestException("Channel query parameter is required");
 		}
 
 		const messages = await this.appService.getMessagesV2({
 			channel,
+			minId,
 		});
 
 		return {
