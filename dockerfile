@@ -6,7 +6,7 @@
     # Сначала только манифесты — чтобы слой с зависимостями кешировался
     COPY package*.json ./
     
-    RUN npm ci
+    RUN npm install
     
     COPY . .
     
