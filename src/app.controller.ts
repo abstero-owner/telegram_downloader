@@ -1,6 +1,17 @@
-import { BadRequestException, Controller, Get, Query } from "@nestjs/common";
+import {
+	BadRequestException,
+	Controller,
+	Get,
+	Param,
+	Query,
+} from "@nestjs/common";
 import { AppService } from "./app.service";
 import { BadRequestError } from "telegram/errors";
+import {
+	DownloadMediaParamsDto,
+	GetMessagesParamsDto,
+	GetMessagesQueryDto,
+} from "./dtos";
 
 @Controller()
 export class AppController {
@@ -27,29 +38,22 @@ export class AppController {
 export class AppControllerV1 {
 	constructor(private readonly appService: AppService) {}
 
-	@Get("channels")
-	async getChannels(@Query("id") channelId: string) {
-		const channels = [];
-
-		return channels;
+	@Get("channels/:channelId/messages")
+	async getMessages(
+		@Param() params: GetMessagesParamsDto,
+		@Query() query: GetMessagesQueryDto,
+	) {
+		return this.appService.getMessagesV2({
+			channel: params.channelId,
+			minId: query.min_id,
+		});
 	}
 
-	@Get("messages")
-	async getMessages(
-		@Query("channel") channel: string,
-		@Query("min_id") minId: number,
-	) {
-		if (!channel) {
-			throw new BadRequestException("Channel query parameter is required");
-		}
-
-		const messages = await this.appService.getMessagesV2({
-			channel,
-			minId,
+	@Get("channels/:channelId/messages/:messageId/media")
+	async downloadMessageMedia(@Param() params: DownloadMediaParamsDto) {
+		return this.appService.downloadMediaToS3({
+			channel: params.channelId,
+			messageId: params.messageId,
 		});
-
-		return {
-			messages,
-		};
 	}
 }

@@ -1,21 +1,23 @@
-import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
-import { Injectable, type OnModuleInit } from "@nestjs/common";
+import { S3Client } from "@aws-sdk/client-s3";
+import { Upload } from "@aws-sdk/lib-storage";
+import {
+	BadRequestException,
+	Injectable,
+	NotFoundException,
+	type OnModuleInit,
+} from "@nestjs/common";
 import { randomUUID } from "node:crypto";
+import { Readable } from "node:stream";
 import { Api, TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions";
-import { getExtension } from "telegram/Utils";
+import * as dayjs from "dayjs";
 
-type GroupedMessage = {
-	id: number;
-	text: string;
-	media: unknown[];
+type Post = {
+	postId: number; // id первого сообщения в группе (или единственного)
+	text: string; // caption/text поста
+	mediaMessageIds: number[]; // все id сообщений с медиа (включая postId если у него есть media)
+	date: string; // timestamp поста (пригодится для сортировки/фильтрации)
 };
-
-function sleep(delay: number) {
-	return new Promise<void>((resolve) => {
-		setTimeout(resolve, delay);
-	});
-}
 
 const s3 = new S3Client({
 	region: "us-east-1",
@@ -54,237 +56,176 @@ export class AppService implements OnModuleInit {
 		return result;
 	}
 
-	async getMessagesV2(options: {
-		channel: string;
-		minId: number;
-		download_media?: boolean;
-	}) {
+	async getMessagesV2(options: { channel: string; minId?: number }) {
 		const { channel, minId } = options;
 
-		const LIMIT = 10;
+		const LIMIT = 20;
 
-		const tgMessages = await this.client.getMessages(channel, {
+		const messages = await this.client.getMessages(channel, {
 			limit: LIMIT,
 			minId: minId,
 		});
 
-		// getMessages возвращает сообщения от новых к старым:
-		// индекс 0 — самое новое, последний индекс — самое старое.
-		const newest = tgMessages[0];
-		const oldest = tgMessages[tgMessages.length - 1];
+		if (messages.length === 0) {
+			return { posts: [], newLastScannedId: minId };
+		}
 
-		// Собираем все сырые сообщения, начиная с основной выборки.
-		const rawMessages = [...tgMessages];
+		// Фильтруем сервисные сообщения и форварды, сортируем по возрастанию id
+		const realMessages = messages
+			.filter((m) => m.className === "Message")
+			.filter((m) => m.fwdFrom == null)
+			.sort((a, b) => a.id - b.id);
 
-		// --- Дочитываем нижнюю границу (старые сообщения) ---
-		// Если самое старое сообщение в выборке принадлежит альбому,
-		// часть этого альбома могла остаться за пределами пагинации (старее).
-		if (oldest?.groupedId) {
-			const targetGroupedId = oldest.groupedId;
-			let offsetId = oldest.id;
-			let keepFetching = true;
+		if (realMessages.length === 0) {
+			// Были только сервисные сообщения / форварды — двигаем курсор, чтобы не зацикливаться
+			const maxId = Math.max(...messages.map((m) => m.id));
+			return { posts: [], newLastScannedId: maxId };
+		}
 
-			while (keepFetching) {
-				const extra = await this.client.getMessages(channel, {
-					limit: 20,
-					offsetId, // получаем сообщения СТАРЕЕ этого id
-				});
+		// Группируем подряд идущие сообщения с одинаковым groupedId
+		const rawGroups: (typeof realMessages)[] = [];
+		let currentGroup: typeof realMessages = [];
+		let currentGroupId: string | null = null;
 
-				if (extra.length === 0) break;
+		for (const msg of realMessages) {
+			const gid = msg.groupedId?.toString() ?? null;
 
-				keepFetching = false;
+			if (gid !== null && gid === currentGroupId) {
+				currentGroup.push(msg);
+			} else {
+				if (currentGroup.length > 0) rawGroups.push(currentGroup);
+				currentGroup = [msg];
+				currentGroupId = gid;
+			}
+		}
+		if (currentGroup.length > 0) rawGroups.push(currentGroup);
 
-				for (const m of extra) {
-					if (m.groupedId && m.groupedId.equals(targetGroupedId)) {
-						rawMessages.push(m);
-						offsetId = m.id;
-						// Продолжаем — вдруг альбом ещё длиннее, чем один батч.
-						keepFetching = true;
-					} else {
-						// Дошли до сообщения из другой группы — альбом закончился.
-						keepFetching = false;
-						break;
-					}
-				}
+		// === Защита от обрезанных альбомов на ОБЕИХ границах ===
+		let completeGroups = [...rawGroups];
+		let droppedTailMaxId: number | null = null;
+
+		// НИЖНЯЯ граница: первая группа может быть хвостом альбома,
+		// начало которого осталось за minId предыдущего запуска.
+		// Признак: это альбом (есть groupedId), но ни в одном сообщении нет текста —
+		// значит caption-сообщение осталось за пределами выборки.
+		if (completeGroups.length > 0) {
+			const firstGroup = completeGroups[0];
+			const firstGroupIsAlbum = firstGroup[0].groupedId != null;
+			const hasAnyText = firstGroup.some(
+				(m) => m.message && m.message.length > 0,
+			);
+
+			if (firstGroupIsAlbum && !hasAnyText) {
+				droppedTailMaxId = Math.max(...firstGroup.map((m) => m.id));
+				completeGroups = completeGroups.slice(1);
 			}
 		}
 
-		// --- Дочитываем верхнюю границу (новые сообщения) ---
-		// Если самое новое сообщение принадлежит альбому, часть альбома
-		// могла быть опубликована позже и не попасть в выборку.
-		if (newest?.groupedId) {
-			const targetGroupedId = newest.groupedId;
-			let minId = newest.id;
-			let keepFetching = true;
+		// ВЕРХНЯЯ граница: последняя группа может быть обрезана лимитом выборки
+		// (начало альбома попало в выборку, конец — нет).
+		if (completeGroups.length > 0) {
+			const lastGroup = completeGroups[completeGroups.length - 1];
+			const lastGroupIsAlbum = lastGroup[0].groupedId != null;
+			const reachedLimit = messages.length >= LIMIT;
 
-			while (keepFetching) {
-				const extra = await this.client.getMessages(channel, {
-					limit: 20,
-					minId, // получаем сообщения НОВЕЕ этого id
-				});
-
-				if (extra.length === 0) break;
-
-				keepFetching = false;
-
-				// extra тоже идёт от новых к старым; нас интересуют только
-				// сообщения того же альбома.
-				for (const m of [...extra].reverse()) {
-					if (m.groupedId && m.groupedId.equals(targetGroupedId)) {
-						rawMessages.push(m);
-						minId = Math.max(minId, m.id);
-						keepFetching = true;
-					}
-				}
+			if (lastGroupIsAlbum && reachedLimit) {
+				completeGroups = completeGroups.slice(0, -1);
 			}
 		}
 
-		// --- Нормализация ---
-		const ungroupedMessages = rawMessages.map((rawMessage) => {
-			const text = rawMessage.text;
-			const id = rawMessage.id;
-			const groupedId = rawMessage.groupedId
-				? rawMessage.groupedId.toJSNumber()
-				: null;
+		if (completeGroups.length === 0) {
+			// Все группы оказались неполными.
+			// Если отбросили хвост снизу — курсор сдвигаем за него (этот хвост уже не нужен).
+			// Иначе курсор не двигаем — повторим запрос в следующий раз.
+			return {
+				posts: [],
+				newLastScannedId: droppedTailMaxId ?? minId,
+			};
+		}
+
+		// Преобразуем группы в посты
+		const posts: Post[] = completeGroups.map((group) => {
+			// Сообщение с текстом — это caption поста (обычно первое, но не всегда)
+			const messageWithText = group.find(
+				(m) => m.message && m.message.length > 0,
+			);
+			const text = messageWithText?.message ?? "";
+
+			// Все сообщения, у которых есть media
+			const mediaMessageIds = group
+				.filter((m) => m.media != null)
+				.map((m) => m.id);
 
 			return {
+				postId: group[0].id, // минимальный id в группе
+				groupedId: group[0].groupedId?.toString() ?? null,
 				text,
-				id,
-				groupedId,
-				media: rawMessage.media,
+				mediaMessageIds,
+				date: dayjs.unix(group[0].date).toISOString(),
 			};
 		});
 
-		// Убираем возможные дубликаты (дочитанные сообщения могли пересечься
-		// с основной выборкой) и сортируем от старых к новым для стабильного
-		// порядка репоста.
-		const seenIds = new Set<number>();
-		const dedupedMessages = ungroupedMessages
-			.filter((m) => {
-				if (seenIds.has(m.id)) return false;
-				seenIds.add(m.id);
-				return true;
-			})
-			.sort((a, b) => a.id - b.id);
+		// Курсор — максимальный id среди всех сообщений последнего полного поста.
+		// Если отбрасывали хвост на нижней границе — учитываем его id тоже,
+		// чтобы в следующий раз не получить этот хвост снова.
+		const lastCompleteGroup = completeGroups[completeGroups.length - 1];
+		let newLastScannedId = Math.max(...lastCompleteGroup.map((m) => m.id));
 
-		// --- Группировка ---
-		const groupedMessagesMap = new Map<number, GroupedMessage>();
-		const result: GroupedMessage[] = [];
-
-		for (const msg of dedupedMessages) {
-			if (msg.groupedId !== null) {
-				const existing = groupedMessagesMap.get(msg.groupedId);
-
-				if (existing) {
-					// Группа уже есть — добавляем media и подхватываем text, если его ещё нет
-					if (msg.media != null) {
-						const buffer = await this.client.downloadMedia(msg.media);
-
-						const ext = getExtension(msg.media);
-
-						const key = randomUUID();
-
-						await s3.send(
-							new PutObjectCommand({
-								Bucket: S3_BUCKET,
-								Key: key,
-								Body: buffer,
-								ContentType: this.guessContentType(key, msg),
-							}),
-						);
-						existing.media.push(key);
-					}
-					if (!existing.text && msg.text) {
-						existing.text = msg.text;
-					}
-				} else {
-					// Первый элемент группы
-					const grouped: GroupedMessage = {
-						id: msg.id,
-						text: msg.text,
-						media: msg.media != null ? [msg.media] : [],
-					};
-					groupedMessagesMap.set(msg.groupedId, grouped);
-					result.push(grouped);
-				}
-			} else {
-				result.push({
-					id: msg.id,
-					text: msg.text,
-					media: msg.media != null ? [msg.media] : [],
-				});
-			}
+		if (droppedTailMaxId !== null) {
+			newLastScannedId = Math.max(newLastScannedId, droppedTailMaxId);
 		}
 
-		return result;
+		return { posts, newLastScannedId };
 	}
 
-	async getMessageV2(options: { channel: string; messageId: number }) {}
+	async downloadMediaToS3(options: { channel: string; messageId: number }) {
+		const { channel, messageId } = options;
 
-	//================================================================================================================
-
-	private async uploadMediaToS3(message: any): Promise<string | null> {
-		if (!message?.media || message.webPreview) return null;
-
-		try {
-			const buffer = (await this.client.downloadMedia(
-				message.media,
-				{},
-			)) as Buffer;
-
-			if (!buffer || buffer.length === 0) return null;
-
-			const originalName =
-				message.media.document?.attributes?.find((a: any) => a.fileName)
-					?.fileName ||
-				(message.media.className === "MessageMediaPhoto"
-					? `photo_${message.id}.jpg`
-					: `media_${message.id}`);
-
-			// уникальный ключ, чтобы файлы из разных каналов/сообщений не перетирали друг друга
-			const key = `${message.id}_${Date.now()}_${originalName}`;
-
-			await s3.send(
-				new PutObjectCommand({
-					Bucket: S3_BUCKET,
-					Key: key,
-					Body: buffer,
-					ContentType: this.guessContentType(originalName, message),
-				}),
+		const messages = await this.client.getMessages(channel, {
+			ids: [messageId],
+		});
+		if (!messages.length) {
+			throw new NotFoundException(
+				"Message with provided ID was not found in this channel",
 			);
-
-			return `${S3_BUCKET}/${key}`;
-		} catch (e: any) {
-			console.error(`Ошибка загрузки медиа в S3: ${e.message}`);
-			return null;
 		}
-	}
 
-	private guessContentType(fileName: string, message: any): string {
-		if (message?.media?.className === "MessageMediaPhoto") {
-			return "image/jpeg";
+		const message = messages[0];
+		if (!message.media) {
+			throw new BadRequestException("This message is not a media message");
 		}
-		const ext = fileName.split(".").pop()?.toLowerCase();
 
-		const map: Record<string, string> = {
-			jpg: "image/jpeg",
-			jpeg: "image/jpeg",
-			png: "image/png",
-			gif: "image/gif",
-			webp: "image/webp",
-			mp4: "video/mp4",
-			mov: "video/quicktime",
-			webm: "video/webm",
-			mp3: "audio/mpeg",
-			ogg: "audio/ogg",
-			pdf: "application/pdf",
-		};
+		const s3Key = randomUUID();
+		const mimeType = getMediaMimeType(message);
 
-		return (ext && map[ext]) || "application/octet-stream";
+		// Итератор по чанкам из Telegram
+		const iterator = this.client.iterDownload({
+			file: message.media,
+			requestSize: 512 * 1024, // опционально, размер чанка
+		});
+
+		// Превращаем async iterator в Node Readable stream
+		const stream = Readable.from(iterator);
+
+		const upload = new Upload({
+			client: s3,
+			params: {
+				Bucket: S3_BUCKET,
+				Key: s3Key,
+				Body: stream,
+				ContentType: mimeType,
+			},
+			queueSize: 4, // сколько частей грузить параллельно
+			partSize: 5 * 1024 * 1024, // минимум 5 MB для multipart
+		});
+
+		await upload.done();
+
+		return { key: s3Key, mimeType };
 	}
 }
 
-function getMimeType(message: Api.Message): string | undefined {
+function getMediaMimeType(message: Api.Message): string | undefined {
 	const media = message.media;
 
 	if (!media) return undefined;
@@ -298,7 +239,7 @@ function getMimeType(message: Api.Message): string | undefined {
 	if (media instanceof Api.MessageMediaDocument) {
 		const document = media.document;
 		if (document instanceof Api.Document) {
-			return document.mimeType; // например "video/mp4", "audio/ogg", "application/pdf"
+			return document.mimeType;
 		}
 	}
 
