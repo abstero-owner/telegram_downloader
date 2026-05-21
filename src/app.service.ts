@@ -11,6 +11,7 @@ import { Readable } from "node:stream";
 import { Api, TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions";
 import * as dayjs from "dayjs";
+import { getExtension } from "telegram/Utils";
 
 type Post = {
 	postId: number; // id первого сообщения в группе (или единственного)
@@ -197,6 +198,7 @@ export class AppService implements OnModuleInit {
 
 		const s3Key = randomUUID();
 		const mimeType = getMediaMimeType(message);
+		const ext = getExtension(message.media);
 
 		// Итератор по чанкам из Telegram
 		const iterator = this.client.iterDownload({
@@ -211,7 +213,7 @@ export class AppService implements OnModuleInit {
 			client: s3,
 			params: {
 				Bucket: S3_BUCKET,
-				Key: s3Key,
+				Key: `${s3Key}.${ext}`,
 				Body: stream,
 				ContentType: mimeType,
 			},
