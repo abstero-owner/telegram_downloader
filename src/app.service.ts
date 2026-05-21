@@ -1,16 +1,17 @@
-import { S3Client } from "@aws-sdk/client-s3";
+import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import {
 	BadRequestException,
 	Injectable,
 	NotFoundException,
 	type OnModuleInit,
 } from "@nestjs/common";
+import * as dayjs from "dayjs";
 import { randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
 import { Api, TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions";
-import * as dayjs from "dayjs";
 import { getExtension } from "telegram/Utils";
 
 type Post = {
@@ -196,9 +197,11 @@ export class AppService implements OnModuleInit {
 			throw new BadRequestException("This message is not a media message");
 		}
 
-		const s3Key = randomUUID();
+		const uuid = randomUUID();
 		const mimeType = getMediaMimeType(message);
 		const ext = getExtension(message.media);
+
+		const s3Key = `${uuid}${ext}`;
 
 		// Итератор по чанкам из Telegram
 		const iterator = this.client.iterDownload({
@@ -213,7 +216,7 @@ export class AppService implements OnModuleInit {
 			client: s3,
 			params: {
 				Bucket: S3_BUCKET,
-				Key: `${s3Key}.${ext}`,
+				Key: s3Key,
 				Body: stream,
 				ContentType: mimeType,
 			},
@@ -223,7 +226,16 @@ export class AppService implements OnModuleInit {
 
 		await upload.done();
 
-		return { key: s3Key, mimeType };
+		const presignedUrl = await getSignedUrl(
+			s3,
+			new GetObjectCommand({
+				Bucket: S3_BUCKET,
+				Key: s3Key,
+			}),
+			{ expiresIn: 60 * 60 * 24 }, // 24 часа
+		);
+
+		return { key: s3Key, mimeType, presignedUrl };
 	}
 }
 
