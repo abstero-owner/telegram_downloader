@@ -200,8 +200,8 @@ export class AppService implements OnModuleInit {
 		const uuid = randomUUID();
 		const mimeType = getMediaMimeType(message);
 		const ext = getExtension(message.media);
-
-		const s3Key = `${uuid}${ext}`;
+		const normalizedExt = ext ? (ext.startsWith(".") ? ext : `.${ext}`) : "";
+		const s3Key = `${uuid}${normalizedExt}`;
 
 		// Итератор по чанкам из Telegram
 		const iterator = this.client.iterDownload({
