@@ -13,6 +13,7 @@ import { Readable } from "node:stream";
 import { Api, TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions";
 import { getExtension } from "telegram/Utils";
+import * as mime from "mime-types";
 
 type Post = {
 	postId: number; // id первого сообщения в группе (или единственного)
@@ -198,10 +199,10 @@ export class AppService implements OnModuleInit {
 		}
 
 		const uuid = randomUUID();
+
 		const mimeType = getMediaMimeType(message);
-		const ext = getExtension(message.media);
-		const normalizedExt = ext ? (ext.startsWith(".") ? ext : `.${ext}`) : "";
-		const s3Key = `${uuid}${normalizedExt}`;
+		const extFromMime = mimeType ? mime.extension(mimeType) : null; // 'mp4', 'jpeg', etc — всегда без точки
+		const s3Key = extFromMime ? `${uuid}.${extFromMime}` : uuid;
 
 		// Итератор по чанкам из Telegram
 		const iterator = this.client.iterDownload({
