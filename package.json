@@ -24,7 +24,6 @@
 		"@aws-sdk/lib-storage": "^3.1050.0",
 		"@aws-sdk/s3-request-presigner": "^3.1051.0",
 		"@biomejs/biome": "^2.4.15",
-		"@nestjs/axios": "github:nestjs/axios",
 		"@nestjs/common": "^11.0.1",
 		"@nestjs/config": "^4.0.4",
 		"@nestjs/core": "^11.0.1",
