@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import { Readable } from "node:stream";
 import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
@@ -8,12 +10,11 @@ import {
 	type OnModuleInit,
 } from "@nestjs/common";
 import * as dayjs from "dayjs";
-import { randomUUID } from "node:crypto";
-import { Readable } from "node:stream";
+import * as mime from "mime-types";
 import { Api, TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions";
-import { getExtension } from "telegram/Utils";
-import * as mime from "mime-types";
+import { TelegramService } from "./telegram.service";
+import { DispatchModerationBodyDto } from "./dtos";
 
 type Post = {
 	postId: number; // id первого сообщения в группе (или единственного)
@@ -40,6 +41,8 @@ const apiHash = process.env.TELEGRAM_API_HASH as string;
 
 @Injectable()
 export class AppService implements OnModuleInit {
+	constructor(private readonly telegram: TelegramService) {}
+
 	private client: TelegramClient = new TelegramClient(session, apiId, apiHash, {
 		connectionRetries: 5,
 	});
@@ -184,6 +187,7 @@ export class AppService implements OnModuleInit {
 	async downloadMediaToS3(options: { channel: string; messageId: number }) {
 		const { channel, messageId } = options;
 
+		console.log("ooo");
 		const messages = await this.client.getMessages(channel, {
 			ids: [messageId],
 		});
@@ -193,7 +197,9 @@ export class AppService implements OnModuleInit {
 			);
 		}
 
+		console.log(messages);
 		const message = messages[0];
+
 		if (!message.media) {
 			throw new BadRequestException("This message is not a media message");
 		}
@@ -237,6 +243,53 @@ export class AppService implements OnModuleInit {
 		);
 
 		return { key: s3Key, mimeType, presignedUrl };
+	}
+
+	async uploadMediaToTelegram(options: { channel: string; messageId: number }) {
+		const { channel, messageId } = options;
+
+		const messages = await this.client.getMessages(channel, {
+			ids: [messageId],
+		});
+
+		const message = messages[0];
+
+		if (!message || message.className !== "Message") {
+			throw new NotFoundException(
+				"Message with provided ID was not found in this channel",
+			);
+		}
+
+		if (!message.media) {
+			throw new BadRequestException("This message is not a media message");
+		}
+
+		const mimeType = getMediaMimeType(message);
+		if (!mimeType) {
+			throw new BadRequestException("Cannot determine media mimeType");
+		}
+
+		const extFromMime = mime.extension(mimeType);
+		const filename = extFromMime
+			? `${randomUUID()}.${extFromMime}`
+			: randomUUID();
+
+		// Скачиваем медиа в Buffer через gramjs
+		const buffer = await this.client.downloadMedia(message.media, {});
+
+		if (!buffer || !(buffer instanceof Buffer)) {
+			throw new BadRequestException("Failed to download media from Telegram");
+		}
+
+		// Загружаем в технический чат через Bot API и получаем file_id
+		const fileId = await this.telegram.uploadMediaAndGetFileId({
+			chat_id: Number(process.env.TELEGRAM_TECH_CHAT_ID),
+			buffer,
+			filename,
+			mimeType,
+		});
+
+		return { file_id: fileId, mimeType, filename };
 	}
 }
 

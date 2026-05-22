@@ -1,13 +1,7 @@
-import {
-	BadRequestException,
-	Controller,
-	Get,
-	Param,
-	Query,
-} from "@nestjs/common";
+import { Body, Controller, Get, Param, Post, Query } from "@nestjs/common";
 import { AppService } from "./app.service";
-import { BadRequestError } from "telegram/errors";
 import {
+	DispatchModerationBodyDto,
 	DownloadMediaParamsDto,
 	GetMessagesParamsDto,
 	GetMessagesQueryDto,
@@ -51,9 +45,16 @@ export class AppControllerV1 {
 
 	@Get("channels/:channelId/messages/:messageId/media")
 	async downloadMessageMedia(@Param() params: DownloadMediaParamsDto) {
-		return this.appService.downloadMediaToS3({
+		return this.appService.uploadMediaToTelegram({
 			channel: params.channelId,
 			messageId: params.messageId,
 		});
+	}
+
+	@Post("moderation/message/dispatch")
+	async dispatchToModeration(@Body() body: DispatchModerationBodyDto) {
+		const data = await this.dispatchToModeration(body);
+
+		return { data };
 	}
 }
